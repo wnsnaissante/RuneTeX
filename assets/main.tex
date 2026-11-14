@@ -1,0 +1,57 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=28mm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{iftex}
+\usepackage{kotex}
+\ifPDFTeX
+  \usepackage[T1]{fontenc}
+\else
+  \IfFontExistsTF{Malgun Gothic}{\setmainhangulfont{Malgun Gothic}}{}
+\fi
+
+\title{Notes on Continuous Optimization}
+\author{Research notes}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Continuous optimization offers a simple language for describing how systems
+improve. These notes introduce the objective function, the geometry of a
+gradient, and the small steps that connect a local decision to a better
+solution.
+\end{abstract}
+
+이 문서는 UTF-8로 저장되며, XeLaTeX와 kotex로 한글을 조판합니다.
+
+\section{Introduction}
+Many questions in science and engineering can be expressed as a search for
+the best possible choice. We choose a model, define what it means to
+improve, and let a sequence of small updates guide us.
+
+The central idea is simple: move in a direction that reduces the objective.
+For a differentiable function, its gradient tells us which direction to take.
+
+\section{Problem formulation}
+Let $f : \mathbb{R}^n \to \mathbb{R}$ be a differentiable function.
+Our task is to find a point that minimizes its value:
+\begin{equation}
+  x^\star = \operatorname*{arg\,min}_{x \in \mathbb{R}^n} f(x).
+\end{equation}
+
+\subsection{Gradient descent}
+Starting from an initial estimate $x_0$, we repeat the update
+\begin{equation}
+  x_{k+1} = x_k - \eta\,\nabla f(x_k),
+\end{equation}
+where $\eta > 0$ is the learning rate. A small enough step makes each
+local decision a useful part of the larger search.
+
+\section{Conclusion}
+Optimization connects a mathematical objective to a practical procedure.
+The quality of a solution depends on the model, the step size, and the
+geometry of the problem. These simple ideas form the foundation for
+many modern learning algorithms.
+
+\end{document}

@@ -1,0 +1,64 @@
+# Cargo outputs, release assets and downloaded dependencies
+/target/
+/dist/
+/artifacts/
+/.deps/
+/.cache/
+
+# Personal documents and RuneTeX runtime data
+/projects/
+.runetex/
+
+# Python tooling caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+/.venv/
+/venv/
+/env/
+
+# Local environment values and signing material
+.env
+.env.*
+!.env.example
+!.env.*.example
+/.secrets/
+/signing/
+*.pfx
+*.p12
+*.p8
+*.jks
+*.keystore
+/.cargo/credentials
+/.cargo/credentials.toml
+
+# Editor state; shared project configuration can still be committed
+.idea/
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.code-workspace
+
+# Temporary files, logs and operating-system metadata
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+~$*
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Original notices are kept in one versioned archive. Expanded notices are
+# a local cache; keep only the archive, checksum and readable source index.
+/licenses/*
+!/licenses/notices.zip
+!/licenses/notices.sha256
+!/licenses/SOURCES.md
+
+# Keep Cargo.lock and assets/ in Git.
