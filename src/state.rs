@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use rune::{Pixels, Span, TextEdit, Tx, Waker};
+use rune::{Span, TextEdit, Tx, Waker};
 
 use crate::compiler::{self, CompileRequest, CompileResult, Diagnostic, Engine};
 
@@ -106,7 +106,6 @@ enum Finished {
         engine: Engine,
         files: Snapshot,
         result: CompileResult,
-        pages: Vec<Pixels>,
     },
     Failed {
         compile: bool,
@@ -149,13 +148,13 @@ pub struct State {
     pub compiling: bool,
     pub saving: bool,
     pub opening: bool,
-    pub preview_pages: Vec<Pixels>,
+    pub preview: crate::preview_cache::PreviewCache,
     pub diagnostics: Vec<Diagnostic>,
     pub log: String,
     pub panel_open: bool,
     pub panel_log: bool,
     pub zoom: f32,
-    pub preview_page: usize,
+    preview_width: f32,
     pub latest_pdf: Option<PathBuf>,
     pub revision: u64,
     pub compiled_revision: Option<u64>,
@@ -292,7 +291,10 @@ impl State {
         let disk = Arc::new(Disk::default());
         let worker_disk = Arc::clone(&disk);
         std::thread::spawn(move || worker(work_rx, finished_tx, thread_waker, worker_disk));
-        let (cached_pdf, cached_pages) = load_cached_preview(&project_dir, &main_file);
+        let cached_document = crate::preview::load_cached(&project_dir, &main_file);
+        let cached_pdf = cached_document.as_ref().map(|doc| doc.pdf_path.clone());
+        let mut preview = crate::preview_cache::PreviewCache::new(Arc::clone(&waker));
+        preview.set_document(cached_document);
         let ui_font_path = project_dir.join(".runetex/ui-font.json");
         let ui_font = crate::preferences::read_ui_font(&ui_font_path);
         let editor_font_path = project_dir.join(".runetex/editor-font.json");
@@ -331,13 +333,13 @@ impl State {
             compiling: false,
             saving: false,
             opening: false,
-            preview_pages: cached_pages,
+            preview,
             diagnostics: Vec::new(),
             log: "컴파일하면 이곳에 LaTeX 출력을 표시합니다.".into(),
             panel_open: false,
             panel_log: false,
             zoom: 1.0,
-            preview_page: 0,
+            preview_width: 0.0,
             latest_pdf: cached_pdf,
             revision: 0,
             compiled_revision: None,
@@ -387,6 +389,12 @@ impl State {
     }
     pub fn preview_stale(&self) -> bool {
         self.compiled_revision != Some(self.revision) || self.compiled_engine != Some(self.engine)
+    }
+    pub fn resize_preview(&mut self, width: f32, anchor: usize, tx: &mut Tx) {
+        if self.preview_width > 0.0 && self.preview_width != width {
+            tx.scroll_into_view(format!("pdf-page-{anchor}"));
+        }
+        self.preview_width = width;
     }
     pub fn project_name(&self) -> String {
         self.project_dir
@@ -648,7 +656,7 @@ impl State {
     }
 
     pub fn poll(&mut self, _time: f64, tx: &mut Tx) -> bool {
-        let mut changed = self.poll_language(tx);
+        let mut changed = self.poll_language(tx) | self.preview.poll();
         if !self.ui_font_applied {
             tx.set_font_families(
                 crate::preferences::ui_families(&self.ui_font),
@@ -678,7 +686,6 @@ impl State {
                     engine,
                     files,
                     result,
-                    pages,
                 } => {
                     debug_assert_eq!(
                         result.generation, revision,
@@ -691,10 +698,12 @@ impl State {
                     self.diagnostics = result.diagnostics;
                     if let Some(path) = result.pdf_path {
                         self.latest_pdf = Some(path);
-                        self.preview_pages = pages;
-                        self.preview_page = self
-                            .preview_page
-                            .min(self.preview_pages.len().saturating_sub(1));
+                        let anchor = self.preview.visible().start;
+                        self.preview.set_document(result.preview);
+                        if let Some(document) = self.preview.document() {
+                            let anchor = anchor.min(document.pages.len().saturating_sub(1));
+                            tx.scroll_into_view(format!("pdf-page-{anchor}"));
+                        }
                         self.compiled_revision = Some(revision);
                         self.compiled_engine = Some(engine);
                         self.message = format!(
@@ -706,7 +715,7 @@ impl State {
                                 " · 새 변경 사항 있음"
                             }
                         );
-                        if self.preview_pages.is_empty() {
+                        if self.preview.document().is_none() {
                             self.message.push_str(" · PDF 렌더러를 확인하세요");
                             self.panel_open = true;
                             self.panel_log = true;
@@ -758,11 +767,12 @@ impl State {
                     self.attempted = None;
                     self.last_edit = None;
                     self.pending_save = false;
-                    self.preview_pages.clear();
+                    self.preview.set_document(None);
+                    self.preview_width = 0.0;
+                    tx.scroll_to_y("preview-scroll", 0.0);
                     self.latest_pdf = None;
                     self.diagnostics.clear();
                     self.dialog = None;
-                    self.preview_page = 0;
                     self.restart_lsp();
                     self.start_compile();
                 }
@@ -1052,20 +1062,11 @@ fn worker(
                     }
                     let engine = request.engine;
                     let result = compiler::compile(request);
-                    let pages = result
-                        .pages
-                        .iter()
-                        .filter_map(|page| {
-                            decode_page(&page.png)
-                                .filter(|pixels| pixels.size() == (page.width, page.height))
-                        })
-                        .collect();
                     Finished::Compiled {
                         revision,
                         engine,
                         files,
                         result,
-                        pages,
                     }
                 }
                 Err(error) => Finished::Failed {
@@ -1151,13 +1152,6 @@ fn worker_write(disk: &Disk, root: &Path, files: &Snapshot) -> std::io::Result<(
     write_snapshot(root, files)
 }
 
-fn decode_page(png: &[u8]) -> Option<Pixels> {
-    let image = image::load_from_memory(png).ok()?.to_rgba8();
-    let pixels = Pixels::new();
-    pixels.set(image.width(), image.height(), image.into_raw());
-    Some(pixels)
-}
-
 fn load_project(path: &Path) -> std::io::Result<(PathBuf, String, Vec<ProjectFile>)> {
     let root = if path.is_file() {
         path.parent().unwrap_or(Path::new(".")).to_path_buf()
@@ -1205,55 +1199,6 @@ fn load_project(path: &Path) -> std::io::Result<(PathBuf, String, Vec<ProjectFil
         .path
         .clone();
     Ok((root, main, files))
-}
-
-fn load_cached_preview(root: &Path, main: &str) -> (Option<PathBuf>, Vec<Pixels>) {
-    let mut builds: Vec<_> = fs::read_dir(root.join(".runetex/build"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .collect();
-    builds.sort_by_key(|entry| {
-        std::cmp::Reverse(entry.metadata().and_then(|meta| meta.modified()).ok())
-    });
-    let job = Path::new(main)
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    for build in builds {
-        let pdf = build.path().join(format!("{job}.pdf"));
-        if !pdf.is_file() {
-            continue;
-        }
-        let mut pngs: Vec<_> = fs::read_dir(build.path())
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                let page = path
-                    .file_stem()?
-                    .to_str()?
-                    .strip_prefix("preview-")?
-                    .parse::<usize>()
-                    .ok()?;
-                (path.extension()? == "png").then_some((page, path))
-            })
-            .collect();
-        pngs.sort_by_key(|(page, _)| *page);
-        let pages: Vec<Pixels> = pngs
-            .into_iter()
-            .take(30)
-            .filter_map(|(_, path)| fs::read(path).ok().and_then(|png| decode_page(&png)))
-            .collect();
-        // A failed LaTeX pass can leave a truncated PDF. Only a completed raster
-        // proves this cached build produced a usable document.
-        if !pages.is_empty() {
-            return (Some(pdf), pages);
-        }
-    }
-    (None, Vec::new())
 }
 
 fn write_snapshot(root: &Path, files: &Snapshot) -> std::io::Result<()> {

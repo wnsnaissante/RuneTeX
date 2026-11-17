@@ -197,6 +197,8 @@ if (-not (Test-Path -LiteralPath $renderer -PathType Leaf)) {
 $renderer = Resolve-RegularFile $renderer
 Assert-X64Executable $renderer
 $rendererDirectory = Split-Path -Parent $renderer
+$pdfInfo = Resolve-RegularFile (Join-Path $rendererDirectory 'pdfinfo.exe')
+Assert-X64Executable $pdfInfo
 $popplerDlls = @($popplerFiles | Where-Object { $_.DirectoryName -ieq $rendererDirectory -and $_.Extension -ieq '.dll' })
 if ($popplerDlls.Count -eq 0) { throw 'The Poppler distribution is missing its runtime DLLs.' }
 foreach ($dll in $popplerDlls) { Assert-X64Executable $dll.FullName }

@@ -2,8 +2,8 @@ mod font_picker;
 mod settings;
 
 use rune::{
-    Color, Cx, El, Family, FileDialogOptions, Key, KeyEvent, ScrollSpec, TextStyle, Tx, col, el,
-    row, text, text_input,
+    Color, Cx, El, Family, FileDialogOptions, GrowthSpec, Key, KeyEvent, ScrollSpec, TextStyle, Tx,
+    col, el, row, text, text_input,
 };
 
 use crate::{
@@ -907,12 +907,16 @@ fn output_panel(s: &State) -> El {
 }
 
 fn preview(s: &State, width: f32) -> El {
+    let document = s.preview.document();
+    let page_count = document.map_or(0, |doc| doc.pages.len());
+    let page_width = ((width - 48.0).min(640.0) * s.zoom).max(100.0);
+    let anchor = s.preview.visible().start;
     let mut pages = col()
         .key("preview-pages")
         .gap(24.0)
         .items_center()
         .padding(24.0);
-    if s.preview_pages.is_empty() {
+    if page_count == 0 {
         pages = pages.child(
             col()
                 .key("preview-empty")
@@ -925,6 +929,8 @@ fn preview(s: &State, width: f32) -> El {
                 .child(label(
                     if s.compiling {
                         "문서를 컴파일하고 있습니다"
+                    } else if s.latest_pdf.is_some() {
+                        "PDF 미리보기를 열 수 없습니다"
                     } else {
                         "문서를 미리 볼 준비가 되었습니다"
                     },
@@ -932,7 +938,11 @@ fn preview(s: &State, width: f32) -> El {
                     "#e6e6e6",
                 ))
                 .child(label(
-                    "Ctrl Enter로 LaTeX를 PDF로 컴파일하세요.",
+                    if s.latest_pdf.is_some() && !s.compiling {
+                        "출력 패널에서 PDF 렌더러 상태를 확인하세요."
+                    } else {
+                        "Ctrl Enter로 LaTeX를 PDF로 컴파일하세요."
+                    },
                     12.0,
                     "#8c8c8c",
                 ))
@@ -943,22 +953,56 @@ fn preview(s: &State, width: f32) -> El {
                 ),
         );
     } else {
-        for (index, pixels) in s.preview_pages.iter().enumerate() {
-            let (pw, ph) = pixels.size();
-            let page_width = ((width - 48.0).min(640.0) * s.zoom).max(100.0);
-            pages = pages.child(
-                el().key(format!("pdf-page-{index}"))
-                    .w(page_width)
-                    .h(page_width * ph as f32 / pw.max(1) as f32)
-                    .fill(Color::WHITE)
-                    .pixels(pixels)
-                    .role("img")
-                    .label(format!("컴파일된 PDF 페이지 {}", index + 1)),
-            );
-        }
+        // The virtual list mounts only nearby UI nodes. Its actual visible
+        // range determines render priority independently of that overscan.
+        let estimate = document
+            .and_then(|doc| doc.pages.first())
+            .map_or(page_width * 1.414, |page| {
+                page_width * page.height / page.width
+            });
+        pages = pages
+            .key(format!(
+                "preview-pages-{}-{}",
+                s.preview.version(),
+                page_width.to_bits()
+            ))
+            .growth(GrowthSpec::default())
+            .virtual_rows(
+                page_count,
+                estimate,
+                |_: &State, index| format!("pdf-page-{index}").into(),
+                move |s: &State, index| {
+                    let size = &s.preview.document().expect("PDF metadata").pages[index];
+                    let page = col()
+                        .w(page_width)
+                        .h(page_width * size.height / size.width)
+                        .fill(Color::WHITE)
+                        .role("img")
+                        .label(format!("컴파일된 PDF 페이지 {}", index + 1));
+                    if let Some(pixels) = s.preview.page(index) {
+                        page.pixels(pixels)
+                    } else {
+                        page.center().padding(16.0).child(
+                            label(
+                                s.preview.error(index).map_or_else(
+                                    || format!("{}페이지 불러오는 중", index + 1),
+                                    |error| format!("{}페이지 미리보기 실패\n{error}", index + 1),
+                                ),
+                                12.0,
+                                "#666666",
+                            )
+                            .wrap()
+                            .w_full(),
+                        )
+                    }
+                },
+            )
+            .virtual_rows_version((s.preview.version(), page_width.to_bits()))
+            .on_visible_rows(|s: &mut State, range| s.preview.show_visible(range));
     }
     col()
         .key("preview-pane")
+        .on_layout_tx(move |s: &mut State, _, tx| s.resize_preview(page_width, anchor, tx))
         .w(width)
         .h_full()
         .min_w(0.0)
@@ -975,9 +1019,9 @@ fn preview(s: &State, width: f32) -> El {
                 .child(label("미리보기", 13.0, "#aaaaaa"))
                 .child(spacer())
                 .child(label(
-                    if s.preview_stale() && !s.preview_pages.is_empty() {
+                    if s.preview_stale() && page_count > 0 {
                         "이전 PDF"
-                    } else if !s.preview_pages.is_empty() {
+                    } else if page_count > 0 {
                         "최신 PDF"
                     } else {
                         ""
@@ -1011,30 +1055,49 @@ fn preview(s: &State, width: f32) -> El {
                 .fill(c("#111111"))
                 .border_sides([0.0, 0.0, 1.0, 0.0], c("#272727"))
                 .child(label(
-                    format!("{} 페이지", s.preview_pages.len()),
+                    {
+                        let visible = s.preview.visible();
+                        if visible.is_empty() {
+                            format!("{page_count} 페이지")
+                        } else if visible.end == visible.start + 1 {
+                            format!("{} / {page_count} 페이지", visible.start + 1)
+                        } else {
+                            format!(
+                                "{}–{} / {page_count} 페이지",
+                                visible.start + 1,
+                                visible.end
+                            )
+                        }
+                    },
                     12.0,
                     "#8c8c8c",
                 ))
                 .child(spacer())
                 .child(
-                    icon_button("zoom-out", "minus", "미리보기 축소", |s| {
-                        s.zoom = (s.zoom - 0.1).max(0.3)
-                    })
-                    .size(24.0, 24.0),
+                    icon_button("zoom-out", "minus", "미리보기 축소", |_| {})
+                        .on_press_tx(|s: &mut State, tx| {
+                            s.zoom = (s.zoom - 0.1).max(0.3);
+                            tx.scroll_into_view(format!("pdf-page-{}", s.preview.visible().start));
+                        })
+                        .size(24.0, 24.0),
                 )
                 .child(
-                    button("zoom-reset", &format!("{:.0}%", s.zoom * 100.0), |s| {
-                        s.zoom = 1.0
-                    })
-                    .h(24.0)
-                    .border(0.0, Color::TRANSPARENT)
-                    .fill(c("#111111")),
+                    button("zoom-reset", &format!("{:.0}%", s.zoom * 100.0), |_| {})
+                        .on_press_tx(|s: &mut State, tx| {
+                            s.zoom = 1.0;
+                            tx.scroll_into_view(format!("pdf-page-{}", s.preview.visible().start));
+                        })
+                        .h(24.0)
+                        .border(0.0, Color::TRANSPARENT)
+                        .fill(c("#111111")),
                 )
                 .child(
-                    icon_button("zoom-in", "plus", "미리보기 확대", |s| {
-                        s.zoom = (s.zoom + 0.1).min(3.0)
-                    })
-                    .size(24.0, 24.0),
+                    icon_button("zoom-in", "plus", "미리보기 확대", |_| {})
+                        .on_press_tx(|s: &mut State, tx| {
+                            s.zoom = (s.zoom + 0.1).min(3.0);
+                            tx.scroll_into_view(format!("pdf-page-{}", s.preview.visible().start));
+                        })
+                        .size(24.0, 24.0),
                 ),
         )
         .child(

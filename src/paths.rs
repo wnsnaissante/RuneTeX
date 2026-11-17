@@ -20,7 +20,7 @@ pub fn bundled_program(name: &str) -> Option<PathBuf> {
     let root = executable.parent()?;
     let folders: &[&str] = match name {
         "texlab" => &["tools/texlab", "tools"],
-        "pdftoppm" => &[
+        "pdftoppm" | "pdfinfo" => &[
             "tools/poppler/Library/bin",
             "tools/poppler/bin",
             "tools/poppler",

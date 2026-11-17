@@ -1,4 +1,4 @@
-//! TeX compilation and PDF rasterization. Call `compile` on a worker thread.
+//! TeX compilation and PDF metadata. Call `compile` on a worker thread.
 //!
 //! Processes receive individual arguments, never shell command text. Each request
 //! has an isolated output directory, so failed builds cannot reuse an older PDF.
@@ -13,10 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TEX_TIMEOUT: Duration = Duration::from_secs(90);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
-const PREVIEW_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_PREVIEW_PAGES: usize = 30;
 const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_PAGE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Engine {
@@ -69,17 +66,10 @@ pub struct Diagnostic {
     pub warning: bool,
 }
 
-#[derive(Debug)]
-pub struct PreviewPage {
-    pub png: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-}
-
 pub struct CompileResult {
     pub generation: u64,
     pub pdf_path: Option<PathBuf>,
-    pub pages: Vec<PreviewPage>,
+    pub preview: Option<crate::preview::Document>,
     pub diagnostics: Vec<Diagnostic>,
     pub log: String,
     pub elapsed: Duration,
@@ -109,14 +99,14 @@ impl CompileResult {
     }
 }
 
-/// Build twice to resolve cross references, then rasterize the actual PDF.
-/// A missing rasterizer preserves the successful PDF and reports a warning.
+/// Build twice to resolve cross references, then read the PDF page metadata.
+/// Page images are rendered separately when their viewport needs them.
 pub fn compile(request: CompileRequest) -> CompileResult {
     let started = Instant::now();
     let mut result = CompileResult {
         generation: request.generation,
         pdf_path: None,
-        pages: Vec::new(),
+        preview: None,
         diagnostics: Vec::new(),
         log: format!("{} · {}\n", request.engine.label(), request.main_file),
         elapsed: Duration::ZERO,
@@ -262,7 +252,18 @@ fn compile_inner(request: &CompileRequest, result: &mut CompileResult) -> Result
     }
     result.pdf_path = Some(pdf.clone());
     result.log.push_str(&format!("\nPDF: {}\n", pdf.display()));
-    render_pdf(&pdf, &build_dir, result);
+    match crate::preview::open(&pdf) {
+        Ok(document) => {
+            result.log.push_str(&format!(
+                "{}페이지 · 보이는 페이지부터 미리보기 생성\n",
+                document.pages.len()
+            ));
+            result.preview = Some(document);
+        }
+        Err(error) => result.warn(format!(
+            "PDF가 생성되었지만 미리보기를 준비하지 못했습니다: {error}"
+        )),
+    }
     Ok(())
 }
 
@@ -326,112 +327,6 @@ fn run_process(
         log,
         timed_out,
     })
-}
-
-fn render_pdf(pdf: &Path, build_dir: &Path, result: &mut CompileResult) {
-    let renderer = crate::paths::program_override("RUNETEX_PDFTOPPM")
-        .or_else(|| crate::paths::bundled_program("pdftoppm"))
-        .or_else(|| find_program("pdftoppm"));
-    let Some(renderer) = renderer else {
-        result.warn("PDF가 생성되었습니다. 미리보기를 사용하려면 Poppler의 pdftoppm을 PATH에 추가하거나 RUNETEX_PDFTOPPM을 지정하세요.");
-        return;
-    };
-    let mut command = Command::new(renderer);
-    command
-        .current_dir(build_dir)
-        .arg("-png")
-        .arg("-scale-to")
-        .arg("1400")
-        .arg("-f")
-        .arg("1")
-        .arg("-l")
-        .arg(MAX_PREVIEW_PAGES.to_string())
-        .arg(pdf)
-        .arg(build_dir.join("preview"));
-    let output = match run_process(command, &build_dir.join("preview.txt"), PREVIEW_TIMEOUT) {
-        Ok(output) => output,
-        Err(error) => {
-            result.warn(format!(
-                "PDF가 생성되었지만 미리보기 실행에 실패했습니다: {error}"
-            ));
-            return;
-        }
-    };
-    result.log.push_str("\n── PDF 미리보기 ──\n");
-    result.log.push_str(&output.log);
-    if output.timed_out || !output.status.success() {
-        result.warn(if output.timed_out {
-            "PDF 미리보기 변환이 60초를 초과해 중단되었습니다. PDF 파일은 사용할 수 있습니다."
-        } else {
-            "PDF가 생성되었지만 미리보기 변환에 실패했습니다. 출력 패널을 확인하세요."
-        });
-        return;
-    }
-    let mut files: Vec<(usize, PathBuf)> = fs::read_dir(build_dir)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            let stem = path.file_stem()?.to_str()?;
-            let page = stem.strip_prefix("preview-")?.parse::<usize>().ok()?;
-            (path.extension()? == "png").then_some((page, path))
-        })
-        .collect();
-    files.sort_by_key(|(page, _)| *page);
-    for (_, path) in files.into_iter().take(MAX_PREVIEW_PAGES) {
-        match load_preview_page(&path) {
-            Ok(page) => result.pages.push(page),
-            Err(error) => {
-                result.warn(format!("PDF 페이지를 읽을 수 없습니다: {error}"));
-                break;
-            }
-        }
-    }
-    if result.pages.is_empty() {
-        result.warn("PDF 미리보기 페이지가 생성되지 않았습니다. PDF 파일을 직접 열어 확인하세요.");
-    } else {
-        result
-            .log
-            .push_str(&format!("{}페이지 미리보기 생성\n", result.pages.len()));
-        if result.pages.len() == MAX_PREVIEW_PAGES {
-            result.warn(
-                "미리보기에는 처음 30페이지까지 표시됩니다. 전체 문서는 PDF 파일에서 확인하세요.",
-            );
-        }
-    }
-}
-
-fn load_preview_page(path: &Path) -> io::Result<PreviewPage> {
-    let file = File::open(path)?;
-    if file.metadata()?.len() > MAX_PAGE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "미리보기 이미지가 너무 큽니다.",
-        ));
-    }
-    let mut png = Vec::new();
-    file.take(MAX_PAGE_BYTES).read_to_end(&mut png)?;
-    let (width, height) = png_dimensions(&png)?;
-    Ok(PreviewPage { png, width, height })
-}
-
-fn png_dimensions(bytes: &[u8]) -> io::Result<(u32, u32)> {
-    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "PNG 헤더가 올바르지 않습니다.",
-        ));
-    }
-    let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
-    let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
-    if width == 0 || height == 0 || width > 8192 || height > 8192 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "PNG 크기가 올바르지 않습니다.",
-        ));
-    }
-    Ok((width, height))
 }
 
 /// Discover standard TeX installations as well as ordinary PATH entries.

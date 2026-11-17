@@ -7,6 +7,8 @@ mod language;
 mod lsp;
 mod paths;
 mod preferences;
+mod preview;
+mod preview_cache;
 mod state;
 mod ui;
 
@@ -66,9 +68,9 @@ fn main() {
         println!("{}", result.log);
         if let Some(path) = &result.pdf_path {
             println!(
-                "PDF: {}\nPreview pages: {}",
+                "PDF: {}\nPages: {}",
                 path.display(),
-                result.pages.len()
+                result.preview.as_ref().map_or(0, |doc| doc.pages.len())
             );
         }
         let success = result.pdf_path.is_some();
